@@ -13,16 +13,14 @@
 # limitations under the License.
 
 # ===================================================================
-# DreamZero – LIBERO goal full fine-tune config
+# DreamZero – LIBERO-10 full fine-tune config
 #
 # Video setup:
-#   frame_window_size = 9 (current frame + 8 future frames for
+#   frame_window_size = 17 (current frame + 16 future frames for
 #   dynamics supervision).  The first frame is the conditioning
-#   observation; the remaining frames are prediction targets for
-#   the video dynamics loss.
+#   observation; the remaining frames form 2 chunks of K=2 latent frames.
 #   VAE temporal compression: latent_frames = 1 + (T-1)//4
-#   T=9 -> 3 latent frames -> 1 conditioning + 2 = 1 block of
-#   num_frame_per_block=2.
+#   T=17 -> 5 latent frames -> 1 conditioning + 4 future latents.
 #
 # Image layout : 2 views (agentview + wrist) @ 128x128 each
 #                tiled vertically → 256×128
@@ -40,7 +38,7 @@
 _ckpt_root = './checkpoints'
 _tokenizer = _ckpt_root + '/Wan2.1-I2V-14B-480P/google/umt5-xxl'
 
-_frame_window_size = 9
+_frame_window_size = 17
 
 model = dict(
     type='DreamZeroVLA',
@@ -48,7 +46,7 @@ model = dict(
     frame_window_size=_frame_window_size,
     pretrained_name_or_path=  # noqa: E251
     _ckpt_root + '/DreamZero-AgiBot',
-    use_cache=False,
+    use_cache=True,
     vlm_backbone=dict(
         type='WanBackbone',
         text_encoder_path=None,
@@ -84,12 +82,16 @@ model = dict(
         noise_beta_alpha=1.5,
         noise_beta_beta=1.0,
         noise_s=0.999,
+        decouple_video_action_noise=False,
+        video_noise_beta_alpha=3.0,
+        video_noise_beta_beta=1.0,
+        decouple_inference_noise=False,
+        video_inference_final_noise=0.8,
         num_inference_steps=16,
         # ----- pretrained paths -----
         use_gradient_checkpointing=True,
-        cfg_scale=1.0,
-        max_chunk_size=-1,
-    ),
+        cfg_scale=5.0,
+        max_chunk_size=2),
     name_mapping={
         'vla_head.model': 'action_head.model',
         'vlm_backbone.text_encoder': 'action_head.text_encoder',
@@ -108,10 +110,10 @@ train_dataloader = dict(
             'action': ['action'],
         },
         statistic_keys=['observation.state', 'timestamp', 'action'],
-        statistic_name='libero_goal_no_noops',
+        statistic_name='libero_10_no_noops',
         datasets=dict(
             type='ParquetDataset',
-            data_root_path='./datasets/libero_goal_no_noops_lerobotv2.1',
+            data_root_path='./datasets/libero_10_no_noops_lerobotv2.1',
             transforms=[
                 dict(
                     type='ProcessParquetInputs',
@@ -158,10 +160,10 @@ train_dataloader = dict(
                     frame_window_size=_frame_window_size,
                 ),
             ],
-            action_window_size=10,
+            action_window_size=20,
             action_key='action',
             use_delta=False,
-            statistic_name='libero_goal_no_noops',
+            statistic_name='libero_10_no_noops',
             window_start_idx=0,
             frame_window_size=_frame_window_size,
         ),
@@ -170,7 +172,7 @@ train_dataloader = dict(
 
 runner = dict(
     type='FSDPTrainRunner',
-    max_epochs=8,
+    max_epochs=10,
     learning_rate=1e-5,
     weight_decay=1e-5,
     max_grad_norm=1.0,
@@ -208,7 +210,7 @@ runner = dict(
 
 eval = dict(
     type='LiberoEvalRunner',
-    task_suite_name='libero_goal',
+    task_suite_name='libero_10',
     model_family='dreamzero',
     eval_chunk_size=10,
     resize_size=128,
@@ -217,9 +219,16 @@ eval = dict(
     seed=7,
     enable_mixed_precision_training=True,
     mixed_precision_dtype='bf16',
-    dataset=dict(
+    dataset=dict[str, str | int
+                 | list[dict[str, str | list[str]]
+                        | dict[str, str | list[list[int]] | list[list[float]]]
+                        | dict[str, str | int]
+                        | dict[str, str | dict[str, str] | int]]]
+    (
         type='LiberoParquetEvalDataset',
-        img_buffer_len=1,
+        # Keep the eval input at 4 observed RGB frames; DreamZeroVLA repeats
+        # them to 8 and prepends the first frame before VAE, matching upstream.
+        img_buffer_len=4,
         transforms=[
             dict(
                 type='ProcessLiberoEvalInputs',
@@ -248,6 +257,15 @@ eval = dict(
                     model_path=_tokenizer,
                 ),
                 max_len=512,
+                negative_prompt=(
+                    'Vibrant colors, overexposed, static, blurry details, '
+                    'text, subtitles, style, artwork, painting, image, still, '
+                    'grayscale, dull, worst quality, low quality, JPEG '
+                    'artifacts, ugly, mutilated, extra fingers, bad hands, '
+                    'bad face, deformed, disfigured, mutated limbs, fused '
+                    'fingers, stagnant image, cluttered background, three '
+                    'legs, many people in the background, walking backwards.'
+                ),  # noqa: E501
                 use_conversation=False,
             ),
             dict(
